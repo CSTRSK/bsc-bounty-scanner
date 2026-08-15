@@ -186,6 +186,12 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
     G. Cross-Contract: tx.origin, Callbacks, unbegrenzte Mint-Pfade
     H. Signatur: Domain-Separation, Permit-Frontrunning
     I. Gas/DoS: unbegrenzte Loops, wachsende Arrays
+    J. Vault/ERC4626: First-Depositor/Inflation, Virtual-Offset, totalAssets, Dead-Share
+    K. Delegatecall/Storage: nutzerkontrollierte Ziele, Layout-Mismatch
+    L. Multicall/Batch: msg.value in Loops
+    M. Router/Approval: Unlimited-Approval, Permit2 ohne Expiry
+    N. Self-Destruct/Griefing: address(this).balance-Abhängigkeit
+    O. NFT (721/1155): Callback-Reentrancy, Royalty-Bypass
     """
     findings = []
     for f in source_files:
@@ -231,16 +237,17 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
                                 "Owner kann Nutzer sofort aussperren.",
                     elements=[name], high_value=False))
 
-        # A4: Mint ohne onlyOwner-Schutz
-        for m in re.finditer(r'function\s+\w*mint\w*\s*\(', src):
+        # A4: Mint ohne onlyOwner-Schutz (nur externe public/external mint-Funktionen)
+        for m in re.finditer(r'function\s+(\w*mint\w*)\s*\([^)]*\)\s*(public|external)', src):
             ctx = src[m.start():m.start()+400]
-            if not re.search(r'(onlyOwner|onlyAdmin|require\s*\(\s*msg\.sender|_mint\s*\([^,]+,\s*[^)]*\))', ctx):
-                findings.append(Finding(
-                    check="unrestricted-mint",
-                    impact="High", confidence="Medium",
-                    description=f"{name}: mint()-Funktion (Zeile ~{line_of(m.start())}) ohne "
-                                "sichtbaren Zugriffsschutz — unbegrenzte Token-Erzeugung.",
-                    elements=[name], high_value=True))
+            if re.search(r'(onlyOwner|onlyAdmin|require\s*\(\s*msg\.sender|onlyRole|_mint\s*\([^,]+,\s*[^)]*\))', ctx):
+                continue
+            findings.append(Finding(
+                check="unrestricted-mint",
+                impact="High", confidence="Medium",
+                description=f"{name}: public mint()-Funktion '{m.group(1)}' (Zeile ~{line_of(m.start())}) ohne "
+                            "sichtbaren Zugriffsschutz — unbegrenzte Token-Erzeugung.",
+                elements=[name], high_value=True))
 
         # ── B. AMM/DEX-FORKS ────────────────────────────────
         # B1: skim/sync von außen aufrufbar
@@ -287,7 +294,8 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
 
         # ── D. GOVERNANCE/DAO ───────────────────────────────
         # D1: Flash-Loan-Voting ohne Snapshot-Delay
-        if re.search(r'(castVote|propose|vote\(|delegate)', src):
+        # Präzise: nur echte vote/propose-Funktionen (nicht delegatecall/delegate)
+        if re.search(r'(function\s+\w*vote\w*\s*\(|function\s+castVote|function\s+propose\s*\(|function\s+submitProposal)', src):
             if not re.search(r'(snapshot|block\.number\s*[<>=]|votingDelay|startBlock)', src):
                 findings.append(Finding(
                     check="flash-loan-voting",
@@ -307,8 +315,8 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
                     elements=[name], high_value=True))
 
         # ── E. PROXY/UPGRADEABLE ────────────────────────────
-        # E1: Upgrade ohne Timelock/Delay
-        if re.search(r'(upgradeTo|upgrade\(|setImplementation)', src):
+        # E1: Upgrade ohne Timelock/Delay (nur Projekt-Code, nicht OZ-Proxy-Boilerplate)
+        if not is_lib and re.search(r'(function\s+upgradeTo\w*\s*\(|function\s+upgrade\s*\(|function\s+setImplementation\s*\()', src):
             if not re.search(r'(timelock|delay|pendingAdmin|queue|twoStep)', src, re.I):
                 findings.append(Finding(
                     check="instant-upgrade-no-timelock",
@@ -411,6 +419,113 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
                 description=f"{name}: .push() auf Storage-Array ohne Pruning — "
                             "unbegrenztes Wachstum → steigende Gas-Kosten.",
                 elements=[name], high_value=False))
+
+        # ── J. VAULT/ERC4626 ────────────────────────────────
+        # J1: First-Depositor/Inflation-Attack
+        if re.search(r'(ERC4626|_convertToShares|previewDeposit|totalAssets)', src):
+            if not re.search(r'(_decimalsOffset|virtualOffset|VIRTUAL_SHARES|VIRTUAL_ASSETS|dead.?share|_mint\s*\([^,]*address\(0\))', src, re.I):
+                findings.append(Finding(
+                    check="erc4626-first-depositor-attack",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: ERC4626-Vault ohne Virtual-Offset/Dead-Share-Schutz — "
+                                "First-Depositor/Inflation-Attack: Angreifer deponiert 1 Wei, "
+                                "spendet direkt große Menge → folgende Deposits runden auf 0 Shares.",
+                    elements=[name], high_value=True))
+
+        # J2: totalAssets liest balanceOf(address(this)) direkt
+        for m in re.finditer(r'function\s+totalAssets\s*\([^)]*\)\s*(public|external)\s*(view)?\s*(override)?\s*\{', src):
+            ctx = src[m.start():m.start()+500]
+            if re.search(r'balanceOf\s*\(?\s*address\s*\(\s*this\s*\)', ctx):
+                findings.append(Finding(
+                    check="erc4626-totalassets-balanceof",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: totalAssets() (Zeile ~{line_of(m.start())}) liest "
+                                "balanceOf(address(this)) direkt — von außen manipulierbar "
+                                "(Donation/Griefing auf Share-Preis).",
+                    elements=[name], high_value=False))
+
+        # ── K. DELEGATECALL/STORAGE ─────────────────────────
+        # K1: Delegatecall an nutzerkontrollierte Adresse
+        for m in re.finditer(r'\.delegatecall\s*\(', src):
+            ctx = src[max(0, m.start()-300):m.start()+200]
+            if re.search(r'(msg\.data|abi\.encode|bytes\s+\w+|input)', ctx) and not re.search(r'(onlyOwner|require\s*\([^)]*(msg\.sender|==\s*(logic|impl|target)))', ctx, re.I):
+                findings.append(Finding(
+                    check="delegatecall-user-controlled",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: delegatecall (Zeile ~{line_of(m.start())}) mit "
+                                "nutzerkontrollierten Daten/Ziel — Storage-Override möglich.",
+                    elements=[name], high_value=True))
+            break
+
+        # ── L. MULTICALL/BATCH ──────────────────────────────
+        # L1: msg.value in Multicall-Loops mehrfach verrechnet
+        if re.search(r'(multicall|batch\w*\(|executeBatch)', src, re.I):
+            if re.search(r'for\s*\(', src) and re.search(r'msg\.value', src):
+                if not re.search(r'(msg\.value\s*==\s*\w+\.length|if\s*\([^)]*msg\.value|msg\.value\s*<)', src):
+                    findings.append(Finding(
+                        check="multicall-msgvalue-loop",
+                        impact="High", confidence="Medium",
+                        description=f"{name}: Multicall/Batch-Loop mit msg.value — wird der "
+                                    "Wert pro Sub-Call verrechnet statt einmal geprüft? "
+                                    "Mehrfachverrechnung führt zu Value-Manipulation.",
+                        elements=[name], high_value=True))
+
+        # ── M. ROUTER/APPROVAL ──────────────────────────────
+        # M1: Unlimited-Approval an upgradebaren Router
+        if re.search(r'(approve\s*\(|increaseAllowance|setApprovalForAll)', src):
+            if re.search(r'(type\(uint256\)\.max|uint256\.max|MAX_UINT|2\s*\*\*\s*256)', src) and \
+               re.search(r'(upgrade|proxy|implementation)', src, re.I):
+                findings.append(Finding(
+                    check="unlimited-approval-upgradeable",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Unlimited-Approval (uint256.max) an upgradebaren "
+                                "Router — Trust-Kette bricht bei Router-Upgrade (alte Approval "
+                                "bleibt voll gültig).",
+                    elements=[name], high_value=False))
+
+        # M2: Permit2-artige Signaturen ohne Ablaufzeit
+        if re.search(r'(permit|signature|ecrecover|_verifySig)', src, re.I):
+            if not re.search(r'(deadline|expiry|expiresAt|validUntil|block\.timestamp)', src):
+                findings.append(Finding(
+                    check="permit-no-expiry",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Signatur-basierte Genehmigung ohne Ablaufzeit — "
+                                "Signaturen bleiben unbegrenzt gültig (Replay-Risiko).",
+                    elements=[name], high_value=False))
+
+        # ── N. SELF-DESTRUCT/GRIEFING ───────────────────────
+        # N1: Verlass auf address(this).balance (per selfdestruct befüllbar)
+        if re.search(r'address\s*\(\s*this\s*\)\s*\.balance', src):
+            findings.append(Finding(
+                check="selfdestruct-balance-griefing",
+                impact="Medium", confidence="Medium",
+                description=f"{name}: Verlass auf address(this).balance — per selfdestruct "
+                            "(forced ETH) von außen befüllbar → Griefing auf "
+                            "Auszahlungs-/Rebase-Logik.",
+                elements=[name], high_value=False))
+
+        # ── O. NFT (BEP-721/1155) ───────────────────────────
+        # O1: Reentrancy über onERC721Received-Callback
+        if re.search(r'(safeTransferFrom|_safeMint|_safeTransfer)', src) and \
+           re.search(r'(onERC721Received|onERC1155Received)', src):
+            if not re.search(r'(nonReentrant|reentrancyGuard|mutex|locked)', src, re.I):
+                findings.append(Finding(
+                    check="nft-callback-reentrancy",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: safeTransferFrom/_safeMint mit onERC721Received-"
+                                "Callback ohne Reentrancy-Guard — Callback kann vor "
+                                "State-Update reentrant eintreten.",
+                    elements=[name], high_value=True))
+
+        # O2: Royalty-Enforcement umgehbar
+        if re.search(r'(royalty|royalties|ERC2981|feePercent)', src, re.I):
+            if not re.search(r'(_checkOnERC721Received|setApprovalForAll|transferFrom)', src):
+                findings.append(Finding(
+                    check="royalty-bypass-surface",
+                    impact="Low", confidence="Low",
+                    description=f"{name}: Royalty-Logik ohne sichtbaren Enforcement-Check — "
+                                "Marketplace-Bypass über direkte transferFrom-Pfade möglich.",
+                    elements=[name], high_value=False))
 
     return findings
 
