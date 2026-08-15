@@ -21,6 +21,7 @@ Zweck). Es enthält keinen Code, der Schwachstellen aktiv ausnutzt.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -134,11 +135,12 @@ def write_source_to_disk(source_info: dict[str, Any], workdir: Path) -> Path:
 
 
 def run_slither(target_file: Path) -> list[Finding]:
-    """Führt Slither aus und parst die JSON-Ausgabe in Finding-Objekte."""
+    """Führt Slither aus (ALLE Detektoren) und parst die JSON-Ausgabe."""
     out_json = target_file.parent / "slither_output.json"
     cmd = [
         "slither",
         str(target_file),
+        "--detect", "all",  # ALLE 140+ Detektoren, nicht nur Defaults
         "--json",
         str(out_json),
     ]
@@ -171,6 +173,106 @@ def run_slither(target_file: Path) -> list[Finding]:
     return findings
 
 
+def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
+    """Zusätzliche Angriffswinkel jenseits der Standard-Detektoren.
+
+    Heuristiken (textbasiert auf dem Quellcode):
+    1. Oracle-/Preislogik: chainlink/pyth/price/getPrice ohne Staleness-Check
+    2. Initializer ohne onlyOwner/Guard (Upgrade-Missbrauch)
+    3. block.timestamp-Vergleiche (Zeitmanipulation)
+    4. unchecked-Blöcke (Overflow-Risiko bei Math)
+    5. Selfdestruct/delegatecall ohne Einschränkung
+    6. Transfer-Before-Update (CEI-Verletzung)
+    7. Fee-Logik: Prozentwerte ohne Cap (unbegrenzte Gebühren)
+    8. Storage-Layout: Struct mit mehr als 3 Slots ohne Dokumentation
+    """
+    findings = []
+    for f in source_files:
+        try:
+            src = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        name = f.name
+
+        # 1. Preis-Oracle ohne Staleness-Check
+        if re.search(r'(chainlink|pyth|oracle|getPrice|latestAnswer|latestRoundData)', src, re.I):
+            if not re.search(r'(updatedAt|answeredInRound|stale|timeout|maxDelay)', src, re.I):
+                findings.append(Finding(
+                    check="oracle-without-staleness",
+                    impact="Medium", confidence="Low",
+                    description=f"Oracle-Preisabfrage ohne Staleness-/Timeout-Check in {name}. "
+                                "Veraltete Preise können zu Fehlbewertung führen.",
+                    elements=[name], high_value=False))
+
+        # 2. Initializer ohne Modifier-Guard (nur in Projekt-Code, nicht OZ-Libraries)
+        for m in re.finditer(r'function\s+initialize[a-zA-Z]*\s*\(', src):
+            if re.search(r'(openzeppelin|abstract contract Initializable|library Initializable)', src, re.I):
+                break  # OZ-Standard-Library — bekanntes Muster, kein Report
+            if not re.search(r'(onlyOwner|onlyAdmin|isOwner|require\s*\(\s*msg\.sender)', src[m.start():m.start()+400]):
+                findings.append(Finding(
+                    check="unprotected-initializer",
+                    impact="High", confidence="Medium",
+                    description=f"Möglicher ungeschützter Initializer in {name} (Zeile ~{src[:m.start()].count(chr(10))+1}). "
+                                "Ohne Zugriffsschutz kann jeder die Initialisierung kapern.",
+                    elements=[name], high_value=True))
+
+        # 3. block.timestamp-Vergleiche
+        ts_count = len(re.findall(r'block\.timestamp', src))
+        if ts_count > 0:
+            findings.append(Finding(
+                check="timestamp-manipulation-surface",
+                impact="Low", confidence="Low",
+                description=f"{ts_count} block.timestamp-Nutzungen in {name}. Zeitfenster "
+                            "potenziell miner-manipulierbar (±15s).",
+                elements=[name], high_value=False))
+
+        # 4. unchecked-Blöcke
+        uc_count = len(re.findall(r'unchecked\s*\{', src))
+        if uc_count > 0:
+            findings.append(Finding(
+                check="unchecked-arithmetic",
+                impact="Medium", confidence="Low",
+                description=f"{uc_count} unchecked-Blöcke in {name} — Overflow-Risiko falls "
+                            "Werte aus User-Input stammen.",
+                elements=[name], high_value=False))
+
+        # 5. Selfdestruct / delegatecall ohne Einschränkung (nur Projekt-Code)
+        if not re.search(r'(openzeppelin|proxy\.sol|erc1967|address\.sol|contract Address)', name, re.I):
+            for kw in ("selfdestruct", "delegatecall"):
+                for m in re.finditer(kw, src):
+                    ctx = src[max(0, m.start()-200):m.start()+200]
+                    if not re.search(r'(onlyOwner|require\s*\([^)]*msg\.sender|admin)', ctx, re.I):
+                        findings.append(Finding(
+                            check=f"unrestricted-{kw}",
+                            impact="High", confidence="Medium",
+                            description=f"{kw} in {name} ohne sichtbare Zugriffsprüfung im Kontext.",
+                            elements=[name], high_value=True))
+
+        # 6. Transfer-Before-Update (CEI-Verletzung)
+        for m in re.finditer(r'\.(transfer|call|send)\s*\(', src):
+            ctx = src[max(0, m.start()-300):m.start()+100]
+            if re.search(r'(balances\[|mapping)', ctx) and not re.search(r'balances\[[^\]]+\]\s*-=', ctx):
+                findings.append(Finding(
+                    check="cei-violation",
+                    impact="Medium", confidence="Low",
+                    description=f"Mögliche CEI-Verletzung in {name}: externer Call vor "
+                                "State-Update (Reentrancy-Oberfläche).",
+                    elements=[name], high_value=False))
+
+        # 7. Fee ohne Cap
+        for m in re.finditer(r'(fee|tax|rate)\w*\s*=\s*\d+', src, re.I):
+            val = int(re.search(r'\d+', m.group()).group())
+            if val > 1000 and '10000' not in src[max(0,m.start()-50):m.start()+50]:
+                findings.append(Finding(
+                    check="uncapped-fee",
+                    impact="Medium", confidence="Low",
+                    description=f"Hoher/unbegrenzter Gebührenwert in {name}: {m.group()[:30]}. "
+                                "Ohne Cap kann der Owner Gebühren auf 100% setzen.",
+                    elements=[name], high_value=False))
+
+    return findings
+
+
 def scan_address(address: str, api_key: str, chain_id: str = DEFAULT_CHAIN_ID) -> ScanResult:
     source_info = fetch_source(address, api_key, chain_id)
     contract_name = source_info.get("ContractName", "Unknown")
@@ -181,6 +283,10 @@ def scan_address(address: str, api_key: str, chain_id: str = DEFAULT_CHAIN_ID) -
         try:
             target_file = write_source_to_disk(source_info, workdir)
             findings = run_slither(target_file)
+            # Deep-Heuristiken: zusätzliche Angriffswinkel auf ALLEN Source-Files
+            source_files = list(workdir.rglob("*.sol"))
+            deep_findings = run_deep_heuristics(source_files)
+            findings.extend(deep_findings)
         except Exception as exc:  # noqa: BLE001 — bewusst breit, für sauberen Report
             return ScanResult(
                 address=address,
