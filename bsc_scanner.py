@@ -176,15 +176,16 @@ def run_slither(target_file: Path) -> list[Finding]:
 def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
     """Zusätzliche Angriffswinkel jenseits der Standard-Detektoren.
 
-    Heuristiken (textbasiert auf dem Quellcode):
-    1. Oracle-/Preislogik: chainlink/pyth/price/getPrice ohne Staleness-Check
-    2. Initializer ohne onlyOwner/Guard (Upgrade-Missbrauch)
-    3. block.timestamp-Vergleiche (Zeitmanipulation)
-    4. unchecked-Blöcke (Overflow-Risiko bei Math)
-    5. Selfdestruct/delegatecall ohne Einschränkung
-    6. Transfer-Before-Update (CEI-Verletzung)
-    7. Fee-Logik: Prozentwerte ohne Cap (unbegrenzte Gebühren)
-    8. Storage-Layout: Struct mit mehr als 3 Slots ohne Dokumentation
+    Umgesetzte Checklisten-Kategorien (bug_checklist.txt):
+    A. Token: SafeERC20, Fee-on-Transfer, Blacklist-Timelock, Mint-Guard
+    B. AMM/DEX: Skimming/Sync, Deadline/Slippage-Enforcement
+    C. Lending: Oracle-Staleness, Reward-Manipulation (same-block)
+    D. Governance: Snapshot-Delay, Timelock-Bypass
+    E. Proxy: Upgrade-Timelock, Uninitialized-Proxy
+    F. Presale: Refund-Reentrancy, Vesting-Berechnung
+    G. Cross-Contract: tx.origin, Callbacks, unbegrenzte Mint-Pfade
+    H. Signatur: Domain-Separation, Permit-Frontrunning
+    I. Gas/DoS: unbegrenzte Loops, wachsende Arrays
     """
     findings = []
     for f in source_files:
@@ -193,82 +194,223 @@ def run_deep_heuristics(source_files: list[Path]) -> list[Finding]:
         except Exception:
             continue
         name = f.name
+        is_lib = bool(re.search(r'(openzeppelin|@uniswap|@pancakeswap|@aave|interface |abstract contract I)', src, re.I))
+        # Zeilennummer-Helfer
+        def line_of(pos):
+            return src[:pos].count("\n") + 1
 
-        # 1. Preis-Oracle ohne Staleness-Check
-        if re.search(r'(chainlink|pyth|oracle|getPrice|latestAnswer|latestRoundData)', src, re.I):
-            if not re.search(r'(updatedAt|answeredInRound|stale|timeout|maxDelay)', src, re.I):
+        # ── A. TOKEN-CONTRACTS ──────────────────────────────
+        # A1: transfer/transferFrom ohne SafeERC20 (USDT-Style-Return-los)
+        if not is_lib and re.search(r'\.transferFrom?\s*\(', src):
+            uses_safe = bool(re.search(r'(SafeERC20|safeTransfer|safeTransferFrom)', src))
+            if not uses_safe:
                 findings.append(Finding(
-                    check="oracle-without-staleness",
+                    check="unsafe-erc20-transfer",
                     impact="Medium", confidence="Low",
-                    description=f"Oracle-Preisabfrage ohne Staleness-/Timeout-Check in {name}. "
-                                "Veraltete Preise können zu Fehlbewertung führen.",
+                    description=f"{name}: Direkte .transfer()/.transferFrom() ohne SafeERC20. "
+                                "Return-lose Tokens (USDT-Style) führen zu silent failures.",
                     elements=[name], high_value=False))
 
-        # 2. Initializer ohne Modifier-Guard (nur in Projekt-Code, nicht OZ-Libraries)
-        for m in re.finditer(r'function\s+initialize[a-zA-Z]*\s*\(', src):
-            if re.search(r'(openzeppelin|abstract contract Initializable|library Initializable)', src, re.I):
-                break  # OZ-Standard-Library — bekanntes Muster, kein Report
-            if not re.search(r'(onlyOwner|onlyAdmin|isOwner|require\s*\(\s*msg\.sender)', src[m.start():m.start()+400]):
+        # A2: Fee-on-Transfer im Transfer-Pfad (Pool-Buchhaltung)
+        if re.search(r'(fee|tax)\w*\s*[=*]|_takeFee|reflect|redistribut', src, re.I) and re.search(r'(transfer|_transfer|balances)', src):
+            if not is_lib:
                 findings.append(Finding(
-                    check="unprotected-initializer",
+                    check="fee-on-transfer-logic",
+                    impact="Medium", confidence="Low",
+                    description=f"{name}: Fee-/Reflexionslogik im Transfer-Pfad. "
+                                "Prüfen ob Pool-Buchhaltung (k-Invariante) dies ausgleicht.",
+                    elements=[name], high_value=False))
+
+        # A3: Blacklist/Pausable ohne Timelock
+        if re.search(r'(blacklist|addToBlacklist|excludeFromReward|paused\s*=\s*true)', src, re.I):
+            if not re.search(r'(timelock|delay|pendingAdmin|queue)', src, re.I):
+                findings.append(Finding(
+                    check="blacklist-without-timelock",
+                    impact="Medium", confidence="Low",
+                    description=f"{name}: Blacklist/Pause-Funktion ohne Timelock/Delay. "
+                                "Owner kann Nutzer sofort aussperren.",
+                    elements=[name], high_value=False))
+
+        # A4: Mint ohne onlyOwner-Schutz
+        for m in re.finditer(r'function\s+\w*mint\w*\s*\(', src):
+            ctx = src[m.start():m.start()+400]
+            if not re.search(r'(onlyOwner|onlyAdmin|require\s*\(\s*msg\.sender|_mint\s*\([^,]+,\s*[^)]*\))', ctx):
+                findings.append(Finding(
+                    check="unrestricted-mint",
                     impact="High", confidence="Medium",
-                    description=f"Möglicher ungeschützter Initializer in {name} (Zeile ~{src[:m.start()].count(chr(10))+1}). "
-                                "Ohne Zugriffsschutz kann jeder die Initialisierung kapern.",
+                    description=f"{name}: mint()-Funktion (Zeile ~{line_of(m.start())}) ohne "
+                                "sichtbaren Zugriffsschutz — unbegrenzte Token-Erzeugung.",
                     elements=[name], high_value=True))
 
-        # 3. block.timestamp-Vergleiche
-        ts_count = len(re.findall(r'block\.timestamp', src))
-        if ts_count > 0:
+        # ── B. AMM/DEX-FORKS ────────────────────────────────
+        # B1: skim/sync von außen aufrufbar
+        for m in re.finditer(r'function\s+(skim|sync)\s*\(', src):
             findings.append(Finding(
-                check="timestamp-manipulation-surface",
+                check="external-skim-sync",
                 impact="Low", confidence="Low",
-                description=f"{ts_count} block.timestamp-Nutzungen in {name}. Zeitfenster "
-                            "potenziell miner-manipulierbar (±15s).",
+                description=f"{name}: {m.group(1)}()-Funktion (Zeile ~{line_of(m.start())}) "
+                            "extern aufrufbar — bei Custom-Fee-Logik prüfen ob Manipulation möglich.",
                 elements=[name], high_value=False))
 
-        # 4. unchecked-Blöcke
-        uc_count = len(re.findall(r'unchecked\s*\{', src))
-        if uc_count > 0:
+        # B2: Fehlende Deadline/Slippage-Enforcement (Protokoll-Ebene)
+        if re.search(r'(swapExact|addLiquidity|removeLiquidity)', src):
+            if not re.search(r'(deadline|amountOutMin|minAmount|maxAmount|slippage)', src):
+                findings.append(Finding(
+                    check="missing-deadline-slippage",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Swap/Liquidity-Funktionen ohne Deadline/Slippage-Check "
+                                "auf Protokollebene — Frontrunning/MEV-Verluste möglich.",
+                    elements=[name], high_value=False))
+
+        # ── C. LENDING/STAKING/FARMING ──────────────────────
+        # C1: Reward-Manipulation durch Same-Block-Deposit+Withdraw
+        if re.search(r'(deposit|stake|enter)', src) and re.search(r'(withdraw|unstake|leave)', src):
+            if re.search(r'(rewardPerShare|accReward|rewardDebt|pendingReward)', src):
+                if not re.search(r'(block\.number|block\.timestamp)\s*[<>=]|lastUpdate', src):
+                    findings.append(Finding(
+                        check="same-block-reward-manipulation",
+                        impact="Medium", confidence="Medium",
+                        description=f"{name}: Reward-Tracker (rewardPerShare/accReward) ohne "
+                                    "Zeit/Durchschnitts-Guard — Deposit+Withdraw im selben Block "
+                                    "kann Rewards manipulieren.",
+                        elements=[name], high_value=False))
+
+        # C2: Liquidation mit Spot-Preis aus dünnem Pool
+        if re.search(r'(liquidation|liquidat)', src, re.I):
+            if re.search(r'(getReserves|getAmountOut|spotPrice|getPrice)', src):
+                findings.append(Finding(
+                    check="thin-pool-liquidation-price",
+                    impact="Medium", confidence="Low",
+                    description=f"{name}: Liquidation nutzt Spot-Preis aus Pool-Reserven — "
+                                "dünne Pools sind preismanipulierbar (Flash-Loan).",
+                    elements=[name], high_value=False))
+
+        # ── D. GOVERNANCE/DAO ───────────────────────────────
+        # D1: Flash-Loan-Voting ohne Snapshot-Delay
+        if re.search(r'(castVote|propose|vote\(|delegate)', src):
+            if not re.search(r'(snapshot|block\.number\s*[<>=]|votingDelay|startBlock)', src):
+                findings.append(Finding(
+                    check="flash-loan-voting",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: Voting ohne Snapshot/Delay-Guard — Flash-Loan-Voting "
+                                "(leihen → voten → zurückzahlen) möglich.",
+                    elements=[name], high_value=True))
+
+        # D2: Timelock-Bypass (alternative Execution-Pfade)
+        if re.search(r'(executeTransaction|executeProposal|queueTransaction)', src):
+            if not re.search(r'(timelock|delay|onlyTimelock|msg\.sender\s*==\s*timelock)', src, re.I):
+                findings.append(Finding(
+                    check="timelock-bypass",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: Execution-Pfad ohne Timelock-Verifikation — "
+                                "Governance-Änderungen sofort durchführbar.",
+                    elements=[name], high_value=True))
+
+        # ── E. PROXY/UPGRADEABLE ────────────────────────────
+        # E1: Upgrade ohne Timelock/Delay
+        if re.search(r'(upgradeTo|upgrade\(|setImplementation)', src):
+            if not re.search(r'(timelock|delay|pendingAdmin|queue|twoStep)', src, re.I):
+                findings.append(Finding(
+                    check="instant-upgrade-no-timelock",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Upgrade-Funktion ohne Timelock — Admin kann "
+                                "sofort upgraden (Storage-Kollision/Asset-Verlust-Risiko).",
+                    elements=[name], high_value=False))
+
+        # E2: Uninitialized-Proxy (initialize von jedem)
+        if re.search(r'(function\s+initialize|initializer)', src):
+            if not re.search(r'(initializer\b|onlyOwner|onlyAdmin|require\s*\(\s*msg\.sender|_initialized|isInitialized)', src):
+                findings.append(Finding(
+                    check="uninitialized-proxy",
+                    impact="High", confidence="High",
+                    description=f"{name}: initialize()-Muster ohne Guard — jeder kann den "
+                                "uninitialisierten Proxy kapern.",
+                    elements=[name], high_value=True))
+
+        # ── F. PRESALE/LAUNCHPAD ────────────────────────────
+        # F1: Refund mit Reentrancy-Fenster
+        for m in re.finditer(r'function\s+\w*(refund|claimRefund|withdrawFunds)\w*\s*\(', src):
+            ctx = src[m.start():m.start()+600]
+            if re.search(r'\.(call|transfer|send)\s*\{?value', ctx) and not re.search(r'(nonReentrant|reentrancyGuard|mutex|locked)', ctx, re.I):
+                findings.append(Finding(
+                    check="refund-reentrancy",
+                    impact="High", confidence="Medium",
+                    description=f"{name}: Refund-Funktion (Zeile ~{line_of(m.start())}) mit "
+                                "ETH-Transfer ohne Reentrancy-Guard.",
+                    elements=[name], high_value=True))
+
+        # F2: Vesting/Cliff-Berechnung
+        if re.search(r'(vesting|cliff|releaseTime|linearRelease)', src, re.I):
+            if not re.search(r'(block\.timestamp|block\.number)', src):
+                findings.append(Finding(
+                    check="vesting-no-time-source",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Vesting-Logik ohne block.timestamp/block.number — "
+                                "Cliff/Release-Berechnung möglicherweise fehlerhaft.",
+                    elements=[name], high_value=False))
+
+        # ── G. CROSS-CONTRACT/COMPOSABILITY ─────────────────
+        # G1: tx.origin für Auth
+        if re.search(r'tx\.origin', src) and not is_lib:
             findings.append(Finding(
-                check="unchecked-arithmetic",
-                impact="Medium", confidence="Low",
-                description=f"{uc_count} unchecked-Blöcke in {name} — Overflow-Risiko falls "
-                            "Werte aus User-Input stammen.",
+                check="tx-origin-auth",
+                impact="High", confidence="Medium",
+                description=f"{name}: tx.origin für Authentifizierung — Phishing-/"
+                            "Callback-Angriffe möglich (msg.sender verwenden).",
+                elements=[name], high_value=True))
+
+        # G2: Callback mit State-Änderung
+        for cb in ("onERC721Received", "onERC1155Received", "onTokenTransfer"):
+            if cb in src and re.search(r'(mapping|balances\[|_transfer|mint)', src):
+                findings.append(Finding(
+                    check=f"callback-state-change-{cb}",
+                    impact="Medium", confidence="Low",
+                    description=f"{name}: {cb}-Callback mit State-Änderungen — Reihenfolge "
+                                "des eigenen States vor Callback prüfen.",
+                    elements=[name], high_value=False))
+
+        # ── H. SIGNATUR-BEZOGEN ─────────────────────────────
+        # H1: ECDSA ohne Domain-Separation
+        if re.search(r'(ecrecover|ECDSA|_verify|recover\(|permit\(|_hashTypedData)', src):
+            if not re.search(r'(DOMAIN_SEPARATOR|domainSeparator|domain_separator|_domainSeparator)', src):
+                findings.append(Finding(
+                    check="missing-domain-separator",
+                    impact="Medium", confidence="Medium",
+                    description=f"{name}: Signatur-Verifikation ohne Domain-Separator — "
+                                "Signaturen können über Chains/Verträge replayable sein.",
+                    elements=[name], high_value=False))
+
+        # H2: Permit-Frontrunning (Nonce-Verbrauch)
+        if re.search(r'permit\(|nonces\[|_nonces', src):
+            if not re.search(r'(nonces\[[^\]]+\]\s*\+{2}|usedNonce|_useNonce)', src):
+                findings.append(Finding(
+                    check="permit-nonce-handling",
+                    impact="Low", confidence="Low",
+                    description=f"{name}: permit()/Nonce-Logik — Frontrunning führt zu "
+                                "dauerhaftem Revert der Original-Tx.",
+                    elements=[name], high_value=False))
+
+        # ── I. GAS/DoS ──────────────────────────────────────
+        # I1: Unbegrenzte Loops über wachsende Arrays
+        for m in re.finditer(r'for\s*\([^)]*\)\s*\{', src):
+            ctx = src[m.start():m.start()+400]
+            if re.search(r'(\.length|holders|userList|array)', ctx):
+                findings.append(Finding(
+                    check="unbounded-loop-dos",
+                    impact="Medium", confidence="Low",
+                    description=f"{name}: Loop (Zeile ~{line_of(m.start())}) über wachsende "
+                                "Struktur — ökonomischer DoS bei großem Zustand.",
+                    elements=[name], high_value=False))
+                break
+
+        # I2: Wachsende Arrays/Mappings ohne Pruning
+        if re.search(r'\.push\s*\(', src) and not re.search(r'(delete\s+\w+\[|\.pop\s*\(|remove)', src):
+            findings.append(Finding(
+                check="growing-storage-array",
+                impact="Low", confidence="Low",
+                description=f"{name}: .push() auf Storage-Array ohne Pruning — "
+                            "unbegrenztes Wachstum → steigende Gas-Kosten.",
                 elements=[name], high_value=False))
-
-        # 5. Selfdestruct / delegatecall ohne Einschränkung (nur Projekt-Code)
-        if not re.search(r'(openzeppelin|proxy\.sol|erc1967|address\.sol|contract Address)', name, re.I):
-            for kw in ("selfdestruct", "delegatecall"):
-                for m in re.finditer(kw, src):
-                    ctx = src[max(0, m.start()-200):m.start()+200]
-                    if not re.search(r'(onlyOwner|require\s*\([^)]*msg\.sender|admin)', ctx, re.I):
-                        findings.append(Finding(
-                            check=f"unrestricted-{kw}",
-                            impact="High", confidence="Medium",
-                            description=f"{kw} in {name} ohne sichtbare Zugriffsprüfung im Kontext.",
-                            elements=[name], high_value=True))
-
-        # 6. Transfer-Before-Update (CEI-Verletzung)
-        for m in re.finditer(r'\.(transfer|call|send)\s*\(', src):
-            ctx = src[max(0, m.start()-300):m.start()+100]
-            if re.search(r'(balances\[|mapping)', ctx) and not re.search(r'balances\[[^\]]+\]\s*-=', ctx):
-                findings.append(Finding(
-                    check="cei-violation",
-                    impact="Medium", confidence="Low",
-                    description=f"Mögliche CEI-Verletzung in {name}: externer Call vor "
-                                "State-Update (Reentrancy-Oberfläche).",
-                    elements=[name], high_value=False))
-
-        # 7. Fee ohne Cap
-        for m in re.finditer(r'(fee|tax|rate)\w*\s*=\s*\d+', src, re.I):
-            val = int(re.search(r'\d+', m.group()).group())
-            if val > 1000 and '10000' not in src[max(0,m.start()-50):m.start()+50]:
-                findings.append(Finding(
-                    check="uncapped-fee",
-                    impact="Medium", confidence="Low",
-                    description=f"Hoher/unbegrenzter Gebührenwert in {name}: {m.group()[:30]}. "
-                                "Ohne Cap kann der Owner Gebühren auf 100% setzen.",
-                    elements=[name], high_value=False))
 
     return findings
 

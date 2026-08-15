@@ -1,0 +1,53 @@
+BSC SMART CONTRACT BUG-CHECKLISTE (für Hermes Agent)
+=======================================================
+
+TOKEN-CONTRACTS (ERC20/BEP20)
+- Fehlende/inkonsistente SafeERC20-Nutzung bei Return-Value-losen Tokens (USDT-Style)
+- Fee-on-Transfer- oder Rebasing-Logik, die Pool-Buchhaltung anderswo bricht
+- Blacklist-/Pausable-Funktionen ohne Timelock
+- Mint-Funktion ohne korrekten onlyOwner-Schutz
+
+AMM/DEX-FORKS (PancakeSwap-Klone)
+- Abweichende k-Invariant-Prüfung nach Swap bei Custom-Fee-Logik
+- Fehlende Deadline-/Slippage-Enforcement auf Protokollebene (nicht nur UI)
+- Von außen aufrufbare Skimming-/Sync-Funktionen
+- LP-Token-Minting bei asymmetrischer Liquidity-Zufuhr
+
+LENDING/STAKING/FARMING
+- Spot-Preis-Abhängigkeit für Collateral/Liquidation aus dünnen Pools
+- Single-Oracle-Reliance ohne Fallback-Feed/Sanity-Check
+- Reward-Manipulation durch Deposit+Withdraw im selben Block
+- Falsche Liquidation-Bonus-Berechnung bei Teil-Liquidation
+
+GOVERNANCE/DAO
+- Flash-Loan-Voting ohne Snapshot-Delay
+- Timelock-Bypass über alternative Execution-Pfade
+- Quorum-Berechnung auf totalSupply() statt zirkulierender Supply
+
+PROXY/UPGRADEABLE-CONTRACTS
+- Admin kann sofort upgraden, kein Delay/Timelock
+- Storage-Slot-Kollisionen nach Upgrade
+- Uninitialized-Proxy: initialize() von jedem aufrufbar
+
+PRESALE/LAUNCHPAD-CONTRACTS
+- Refund-Logik mit Reentrancy-Fenster
+- Vesting: falsche Cliff-/Linear-Release-Zeitberechnung
+- Whitelist-Bypass über direkten Contract-Call statt Frontend
+
+CROSS-CONTRACT/COMPOSABILITY
+- Unbegrenzte Mint-Pfade oder fragile Peg-Mechanismen
+- Callback-Funktionen (onERC721Received etc.) mit State-Änderung vor eigenem State
+- tx.origin statt msg.sender für Authentifizierung
+
+SIGNATUR-BEZOGEN
+- Replayable/domänenübergreifende Signaturen durch fehlende Domain-Separation
+- Permit-Front-Running: Nonce wird fremdverbraucht, Original-Tx revertiert dauerhaft
+
+GAS/DoS
+- Unbegrenzte Loops oder wachsende Arrays/Mappings -> ökonomischer DoS
+
+ZUSATZ-ANSÄTZE (wenig genutzt, hohe Trefferchance)
+- Fork-Diffing: Contract gegen bekanntes Original (Uniswap/PancakeSwap/Compound)
+  diffen, nur geänderte Zeilen priorisieren
+- Upgrade-Governance-Check: prüfen ob Admin-Key allein upgraden kann (kein Multisig/Timelock)
+- Oracle-Staleness-Heuristik: prüfen ob updatedAt/Sanity-Check überhaupt im Code vorkommt
